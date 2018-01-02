@@ -323,4 +323,7 @@ int procstat_create_histogram_u32_series(struct procstat_context *context, struc
 
 void procstat_histogram_u32_add_point(struct procstat_histogram_u32 *series, uint32_t value);
 
+struct procstat_item *procstat_lookup_item(struct procstat_context *context,
+		struct procstat_item *parent, const char *name);
+
 #endif
