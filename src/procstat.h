@@ -325,7 +325,7 @@ int procstat_create_multiple_u64_series(struct procstat_context *context,
 /**
  * @brief add points to series statistics
  */
-void procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t value);
+int procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t value);
 
 int procstat_create_histogram_u32_series(struct procstat_context *context, struct procstat_item *parent,
 					 const char *name, struct procstat_histogram_u32 *series);

@@ -769,12 +769,14 @@ error_release:
 	return -1;
 }
 
-void procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t value)
+int procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t value)
 {
 	int64_t delta;
 	int64_t delta2;
 	int64_t avg_delta;
 	unsigned reset;
+	bool max_changed = false;
+	bool min_changed = false;
 
 	/* We dont care about ordering of reset with another thread
 	 * we dont care if because of some raise we will do 2 resets */
@@ -789,10 +791,16 @@ void procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t 
 		__atomic_store_n(&series->reset, 0, __ATOMIC_RELEASE);
 	}
 
-	if (value < series->min)
+	if (value < series->min) {
 		series->min = value;
-	if (value > series->max)
+		min_changed = true;
+	}
+
+	if (value > series->max) {
 		series->max = value;
+		max_changed = true;
+	}
+
 	++series->count;
 	series->last = value;
 	series->sum += value;
@@ -804,6 +812,13 @@ void procstat_u64_series_add_point(struct procstat_series_u64 *series, uint64_t 
 	series->mean = (int64_t)series->mean + avg_delta;
 	delta2 = (int64_t)value - series->mean;
 	series->aggregated_variance += delta * delta2;
+
+	if (max_changed)
+		return 1;
+	else if (min_changed)
+		return -1;
+	else
+		return 0;
 }
 
 enum series_u64_type{
