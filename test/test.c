@@ -195,11 +195,13 @@ static void create_multiple_series(struct procstat_item *root)
 
 static inline unsigned long long rdtsc(void)
 {
-	unsigned long low, high;
+	unsigned long long high;
 
-	asm volatile("rdtsc" : "=a" (low), "=d" (high));
+	asm volatile("mrs %0, cntvct_el0" : "=r" (high));
+	return high;
+	//asm volatile("rdtsc" : "=a" (low), "=d" (high));
 
-	return ((low) | (high) << 32);
+	//return ((low) | (high) << 32);
 }
 
 
