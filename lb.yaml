@@ -6,3 +6,6 @@ procstat:
       - make -f Makefile.lb install
     deps:
     - file://src
+    - file://lb.yaml
+    - file://Makefile.lb
+
