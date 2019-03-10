@@ -1,7 +1,7 @@
 procstat:
   procstat:
     build: 
-      - make -f Makefile.lb all
+      - make -f Makefile.lb CROSS=aarch64-linux-gnu- ARCH=arm64 all
     install: 
       - make -f Makefile.lb install
     deps:
