@@ -71,3 +71,6 @@ This will expose counter value as file <mountpoint>/outer-directory/inner-direct
 
 ## Advanced Usage
 FIXME: add advanced usage examples...
+
+## Contributions
+By sending PRs in github
