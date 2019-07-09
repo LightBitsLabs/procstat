@@ -2,6 +2,8 @@ procstat:
   procstat:
     build: 
       - make -f Makefile.lb all
+    test:
+      - make -f Makefile.lb test
     install: 
       - make -f Makefile.lb install
     deps:
