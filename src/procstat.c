@@ -58,6 +58,7 @@ enum {
 	STATS_ENTRY_FLAG_REGISTERED  = 1 << 0,
 	STATS_ENTRY_FLAG_DIR	     = 1 << 1,
 	STATS_ENTRY_FLAG_HISTOGRAM   = 1 << 2,
+	STATS_ENTRY_FLAG_AGGREGATOR  = 1 << 3,
 };
 
 #define ATTRIBUTES_TIMEOUT_SEC (60.0 * 60)
@@ -425,6 +426,7 @@ static bool allowed_open(struct procstat_item *item, struct fuse_file_info *fi)
 struct read_struct {
 	ssize_t size;
 	char buffer[READ_BUFFER_SIZE];
+	void *ext;
 };
 
 static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -449,6 +451,7 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (!allowed_open(item, fi))
 		goto out_locked;
 
+	read_buffer->ext = NULL;
 	fi->fh = (uint64_t)read_buffer;
 
 	/* we dont know size of file in advance so use directio*/
@@ -467,10 +470,94 @@ out_locked:
 	fuse_reply_err(req, ret);
 }
 
+#define AGGR_EXTRA_BYTES 100
+
+struct aggregator_context {
+	size_t current;
+	size_t discard_bytes; /* from the front of the current */
+	size_t off;
+};
+
+struct aggregator_struct {
+	struct aggregator_context c;
+	size_t buf_size;
+	char buffer[0];
+};
+
+#define TEST_NR_ENTRIES 20000
+
+static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct read_struct *rs, size_t size, off_t off)
+{
+	struct aggregator_struct *as = (struct aggregator_struct *)rs->ext;
+	size_t total;
+	size_t _size;
+	size_t _off;
+
+	if (!as || (as->buf_size < size + AGGR_EXTRA_BYTES)) {
+		struct aggregator_context c;
+
+		if (!as) {
+			c.current = 0;
+			c.discard_bytes = 0;
+			c.off = 0;
+		} else {
+			c = as->c;
+			free(as);
+		}
+
+		as = malloc(sizeof(*as) + size + AGGR_EXTRA_BYTES);
+		if (!as) {
+			fuse_reply_buf(req, NULL, 0);
+			return;
+		}
+		as->c = c;
+		as->buf_size = size + AGGR_EXTRA_BYTES;
+		rs->ext = (void *)as;
+	}
+
+	if (as->c.current >= TEST_NR_ENTRIES) {
+		fuse_reply_buf(req, NULL, 0);
+		return;
+	}
+
+	if (off != as->c.off) {
+		/* we do not support non-sequential read */
+		total = sprintf(&as->buffer[0], "Unexpected offset %ld wanted %ld size %ld\n", off, as->c.off, size);
+		as->c.current = TEST_NR_ENTRIES;
+		fuse_reply_buf(req, &as->buffer[0], total);
+		return;
+	}
+
+	_size = size + as->c.discard_bytes;
+	_off = as->c.discard_bytes;
+	as->c.discard_bytes = 0;
+	for (total = 0; as->c.current < TEST_NR_ENTRIES; as->c.current++) {
+		int space = as->buf_size - total;
+		int len = snprintf(&as->buffer[total], space, "blabla (size=%ld offset=%ld) %ld\n", size, off, as->c.current);
+		if (len > space) {
+			len = space;
+		}
+		total += len;
+		if (total >= _size) {
+			as->c.discard_bytes = total - _size;
+			total = _size;
+			break;
+		}
+	}
+	total -= _off;
+	as->c.off += total;
+	fuse_reply_buf(req, &as->buffer[_off], total);
+}
+
 static void fuse_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
 	struct read_struct *read_buffer = (struct read_struct *)fi->fh;
 	struct procstat_file *file = fuse_inode_to_file(ino);
+
+	if (file->base.flags & STATS_ENTRY_FLAG_AGGREGATOR) {
+		aggregator_read(req, file, read_buffer, size, off);
+		return;
+	}
 
 	if (!file->fmt) {
 		fuse_reply_buf(req, NULL, 0);
@@ -751,6 +838,28 @@ error_release:
 	for (; i >= 0; --i)
 		procstat_remove_by_name(context, parent, descriptors[i].name);
 	return -1;
+}
+
+int procstat_create_aggregator(struct procstat_context *context,
+			      struct procstat_item *parent,
+			      const char *name)
+{
+	parent = parent_or_root(context, parent);
+	if (!parent) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	struct procstat_file *file;
+
+	file = create_file(context, (struct procstat_directory *)parent,
+			   name, NULL, NULL, NULL);
+	if (!file)
+		return -1;
+
+	file->base.flags |= STATS_ENTRY_FLAG_AGGREGATOR;
+
+	return 0;
 }
 
 bool is_reset(struct reset_info* reset)
@@ -1131,7 +1240,11 @@ static void fuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 	if (--item->refcnt == 0)
 		free_item(item);
 	pthread_mutex_unlock(&context->global_lock);
-	free((void *)fi->fh);
+	if (fi->fh) {
+		struct read_struct *fh = (struct read_struct *)fi->fh;
+		free(fh->ext);
+		free(fh);
+	}
 	fuse_reply_err(req, 0);
 }
 
