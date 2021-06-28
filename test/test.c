@@ -195,11 +195,20 @@ static void create_multiple_series(struct procstat_item *root)
 
 static inline unsigned long long rdtsc(void)
 {
+#ifdef __x86_64__
 	unsigned long low, high;
 
 	asm volatile("rdtsc" : "=a" (low), "=d" (high));
 
 	return ((low) | (high) << 32);
+#elif defined __aarch64__
+	unsigned long long tsc;
+	// TODO: check if we can switch to pmccntr_el0
+	asm volatile("mrs %0, cntvct_el0" : "=r"(tsc));
+	return tsc;
+#else
+#error "Unsupported arch"
+#endif
 }
 
 
