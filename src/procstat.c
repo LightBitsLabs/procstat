@@ -65,6 +65,10 @@ enum {
 
 #define ATTRIBUTES_TIMEOUT_SEC (60.0 * 60)
 #define DNAME_INLINE_LEN 32
+
+#define NR_ROOT_INDEXES 256
+typedef uint8_t lock_index_t;
+
 struct procstat_dynamic_name {
 	unsigned zero:8;
 	char     *buffer;
@@ -80,7 +84,8 @@ struct procstat_item {
 	uint32_t 	       name_hash;
 	struct list_head       entry;
 	int 		       refcnt;
-	unsigned 	       flags;
+	uint16_t       	       flags;
+	lock_index_t           root_index;
 };
 
 struct procstat_directory {
@@ -102,13 +107,30 @@ struct procstat_context {
 	struct fuse_session *session;
 	gid_t	gid;
 	uid_t   uid;
-	pthread_mutex_t global_lock;
+	uint8_t last_root_index;
+	pthread_mutex_t root_locks[NR_ROOT_INDEXES];
 };
 
 struct procstat_series {
 	struct procstat_directory root;
 	void  	    		  *private;
 };
+
+static inline void item_lock(struct procstat_context *context, struct procstat_item *item)
+{
+	if (item->parent->root_index != item->root_index) {
+		pthread_mutex_lock(&context->root_locks[item->parent->root_index]);
+	}
+	pthread_mutex_lock(&context->root_locks[item->root_index]);
+}
+
+static inline void item_unlock(struct procstat_context *context, struct procstat_item *item)
+{
+	pthread_mutex_unlock(&context->root_locks[item->root_index]);
+	if (item->parent->root_index != item->root_index) {
+		pthread_mutex_unlock(&context->root_locks[item->parent->root_index]);
+	}
+}
 
 static uint32_t string_hash(const char *string)
 {
@@ -249,15 +271,15 @@ static void fuse_lookup(fuse_req_t req, fuse_ino_t parent_inode, const char *nam
 	static struct procstat_directory *parent;
 	struct procstat_item *item;
 	struct fuse_entry_param fuse_entry;
-
+        lock_index_t lock;
 	memset(&fuse_entry, 0, sizeof(fuse_entry));
 
-	pthread_mutex_lock(&context->global_lock);
 	parent = fuse_inode_to_dir(request_context(req), parent_inode);
+	lock = item_lock(context, &parent->base);
 
 	item = lookup_item_locked(parent, name, string_hash(name));
 	if ((!item) || (!item_registered(item))) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, lock);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
@@ -266,7 +288,7 @@ static void fuse_lookup(fuse_req_t req, fuse_ino_t parent_inode, const char *nam
 	item->refcnt++;
 	fuse_entry.attr_timeout = ATTRIBUTES_TIMEOUT_SEC;
 	fill_item_stats(context, item, &fuse_entry.attr);
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fuse_reply_entry(req, &fuse_entry);
 }
 
@@ -274,16 +296,17 @@ static void item_put_locked(struct procstat_item *item);
 static void fuse_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup) {
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item;
+        lock_index_t lock;
 
-	pthread_mutex_lock(&context->global_lock);
 	item = (struct procstat_item *)(ino);
+	lock = item_lock(context, item);
 	if (nlookup >= item->refcnt) {
 		item->refcnt = 1;
 		item_put_locked(item);
 	} else {
 		item->refcnt -= nlookup;
 	}
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fuse_reply_none(req);
 }
 
@@ -292,18 +315,19 @@ static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 	struct stat stat;
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item;
+        lock_index_t lock;
 
 	memset(&stat, 0, sizeof(stat));
-	pthread_mutex_lock(&context->global_lock);
 	item = fuse_inode_to_item(context, ino);
+	lock = item_lock(context, item);
 	if (!item_registered(item)) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, lock);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 
 	fill_item_stats(context, item, &stat);
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fuse_reply_attr(req, &stat, ATTRIBUTES_TIMEOUT_SEC);
 }
 
@@ -311,17 +335,18 @@ static void fuse_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 {
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item;
+        lock_index_t lock;
 
-	pthread_mutex_lock(&context->global_lock);
 	item = fuse_inode_to_item(context, ino);
+	lock = item_lock(context, item);
 
 	if (!item_registered(item)) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, lock);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 	++item->refcnt;
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fi->fh = 0;
 	fuse_reply_open(req, fi);
 }
@@ -356,12 +381,13 @@ static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 	size_t bufsize;
 	size_t offset;
 	int alloc_factor = 0;
+        lock_index_t lock;
 
-	pthread_mutex_lock(&context->global_lock);
 	dir = fuse_inode_to_dir(context, ino);
+	lock = item_lock(context, &dir->base);
 
 	if (!item_registered(&dir->base)) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, lock);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
@@ -404,7 +430,7 @@ static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 		offset += entry_size;
 	}
 
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	if (off < offset)
 		fuse_reply_buf(req, reply_buffer + off, MIN(size, offset - off));
 	else
@@ -439,6 +465,7 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	struct procstat_item *item;
 	struct read_struct *read_buffer;
 	int ret = EACCES;
+        lock_index_t lock;
 
 	read_buffer = malloc(sizeof(struct read_struct));
 	if (!read_buffer) {
@@ -446,8 +473,8 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		return;
 	}
 
-	pthread_mutex_lock(&context->global_lock);
 	item = (struct procstat_item *)(ino);
+	lock = item_lock(context, item);
 
 	if (!item_registered(item))
 		goto out_locked;
@@ -465,13 +492,13 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (item->flags & STATS_ENTRY_FLAG_AGGREGATOR)
 		++item->parent->base.refcnt;
 
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fuse_reply_open(req, fi);
 
 	return;
 
 out_locked:
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	free(read_buffer);
 	fuse_reply_err(req, ret);
 }
@@ -577,6 +604,7 @@ static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct r
 	struct list_head *last = &dir->children;
 	struct list_head *self = &file->base.entry;
 	struct out_stream out;
+	lock_index_t lock;
 	char path[MAX_PATH_LEN];
 
 	struct procstat_context *context = request_context(req);
@@ -625,7 +653,7 @@ static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct r
 	/*
 	 * While the aggregator node is open, the node and the parent directory node cannot be freed, so setting "last" above was safe.
 	 */
-	pthread_mutex_lock(&context->global_lock);
+	lock = item_lock(context, &file->base);
 
 	if (!as->c.current) {
 		as->c.current = dir->children.next;
@@ -667,7 +695,7 @@ static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct r
 		++(container_of(as->c.current, struct procstat_item, entry)->refcnt);
 
 	as->c.off += out.total;
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 	fuse_reply_buf(req, &out.buf[0], out.total);
 }
 
@@ -771,21 +799,29 @@ static int register_item(struct procstat_context *context,
 			 struct procstat_item *item,
 			 struct procstat_directory *parent)
 {
-	pthread_mutex_lock(&context->global_lock);
-	if (parent) {
-		struct procstat_item *duplicate;
-
-		duplicate = lookup_item_locked(parent, procstat_item_name(item), item->name_hash);
-		if (duplicate) {
-			pthread_mutex_unlock(&context->global_lock);
-			return EEXIST;
-		}
-		list_add_tail(&item->entry, &parent->children);
-	}
 	item->flags |= STATS_ENTRY_FLAG_REGISTERED;
 	item->refcnt = 1;
 	item->parent = parent;
-	pthread_mutex_unlock(&context->global_lock);
+
+	if (parent) {
+		struct procstat_item *duplicate;
+		lock_index_t lock = item_lock(context, parent->base);
+		/* this is not root: let's see if this is a directory directly under root */
+		if (parent->base.root_index == 0) {
+			assert (context->last_root_index != NR_ROOT_INDEXES - 1);
+			item->root_index = context->last_root_index++;
+		} else {
+			item->root_index = parent->base.root_index; /* inherit from the parent */
+		}
+
+		duplicate = lookup_item_locked(parent, procstat_item_name(item), item->name_hash);
+		if (duplicate) {
+			item_unlock(context, lock);
+			return EEXIST;
+		}
+		list_add_tail(&item->entry, &parent->children);
+		item_unlock(context, lock);
+	}
 	return 0;
 }
 
@@ -811,6 +847,10 @@ static void item_put_children_locked(struct procstat_directory *directory)
 {
 	struct procstat_item *iter, *n;
 	list_for_each_entry_safe(iter, n, &directory->children, entry) {
+		lock_index_t lock;
+		if (iter->root_index != iter->parent->root_index) {
+			lock = 
+		}
 		iter->parent = NULL;
 		list_del_init(&iter->entry);
 		item_put_locked(iter);
@@ -906,11 +946,12 @@ struct procstat_item *procstat_create_directory(struct procstat_context *context
 void procstat_remove(struct procstat_context *context, struct procstat_item *item)
 {
 	struct procstat_directory *directory;
+	lock_index_t lock;
 
 	assert(context);
 	assert(item);
 
-	pthread_mutex_lock(&context->global_lock);
+	lock = item_lock(context, item);
 	if (!item_type_directory(item))
 		goto remove_item;
 
@@ -921,11 +962,12 @@ void procstat_remove(struct procstat_context *context, struct procstat_item *ite
 	}
 
 remove_item:
+	if (item->root_index != 
 	item->flags &= ~STATS_ENTRY_FLAG_REGISTERED;
 	list_del_init(&item->entry); /* Make it not discoverable */
 	item_put_locked(item);
 done:
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, lock);
 }
 
 int procstat_remove_by_name(struct procstat_context *context,
@@ -1352,30 +1394,30 @@ void fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
 	struct procstat_item *item;
 
 	memset(&stat, 0, sizeof(stat));
-	pthread_mutex_lock(&context->global_lock);
 
 	item = fuse_inode_to_item(context, ino);
+	item_lock(context, item);
 	if (!item_registered(item)) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, item);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 
 	if (!fuse_inode_to_file(ino)->writer) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, item);
 		fuse_reply_err(req, EPERM);
 		return;
 	}
 
 	/* only support for truncate as it is needed during write */
 	if (to_set != FUSE_SET_ATTR_SIZE) {
-		pthread_mutex_unlock(&context->global_lock);
+		item_unlock(context, item);
 		fuse_reply_err(req, EINVAL);
 		return;
 	}
 
 	fill_item_stats(context, item, &stat);
-	pthread_mutex_unlock(&context->global_lock);
+	item_unlock(context, item);
 	fuse_reply_attr(req, &stat, 1.0);
 }
 
@@ -1443,7 +1485,8 @@ struct procstat_context *procstat_create(const char *mountpoint)
 	context->uid = getuid();
 	context->gid = getgid();
 
-	pthread_mutex_init(&context->global_lock, NULL);
+	context->last_root_index = 0;
+	pthread_mutex_init(&context->root_locks[0], NULL);
 	init_directory(context, &context->root, ROOT_DIR_NAME, NULL);
 
 	channel = fuse_mount(context->mountpoint, &args);
