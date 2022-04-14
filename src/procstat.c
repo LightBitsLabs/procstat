@@ -54,6 +54,14 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*a))
 #endif
 
+#ifndef unlikely
+#define unlikely(x)     __builtin_expect(!!(x), 0)
+#endif
+
+#ifndef likely
+#define likely(x)       __builtin_expect(!!(x), 1)
+#endif
+
 enum {
 	STATS_ENTRY_FLAG_REGISTERED  = 1 << 0,
 	STATS_ENTRY_FLAG_DIR	     = 1 << 1,
