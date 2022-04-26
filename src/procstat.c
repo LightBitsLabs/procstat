@@ -33,21 +33,26 @@
 
 
 #define FUSE_USE_VERSION 26
-#include <fuse/fuse_lowlevel.h>
-#include <stdbool.h>
-#include <errno.h>
-#include "procstat.h"
+
 #include "list.h"
+#include "procstat.h"
+
+#include <fuse/fuse_lowlevel.h>
+
+#include <sys/param.h>
+
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
-#include <stdlib.h>
 #include <pthread.h>
-#include <string.h>
-#include <assert.h>
-#include <sys/param.h>
-#include <ctype.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdlib.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #ifndef ARRAY_SIZE
@@ -60,6 +65,71 @@ enum {
 	STATS_ENTRY_FLAG_HISTOGRAM   = 1 << 2,
 	STATS_ENTRY_FLAG_AGGREGATOR  = 1 << 3,
 };
+
+typedef union procstat_mutex_pool_entry_u {
+	pthread_mutex_t mutex;
+	union procstat_mutex_pool_entry_u *next_free;
+} procstat_mutex_pool_entry_t;
+
+static procstat_mutex_pool_entry_t mutex_pool[128];
+static procstat_mutex_pool_entry_t *mutex_free_list = NULL;
+
+_Static_assert(offsetof(procstat_mutex_pool_entry_t, mutex) == 0, "mutex not aligned with union");
+
+/**
+ * @brief Check out a mutex from the pool.
+ *
+ * Extracts a mutex pool entry from the linked list of free nodes,
+ * then initializes it as a POSIX mutex.
+ *
+ * @par Thread safety
+ * This function is MT-Safe.
+ *
+ * @return a pointer to a POSIX mutex, or @c NULL if no more
+ * mutexes are available
+ */
+static inline pthread_mutex_t *procstat_retain_mutex_from_pool()
+{
+	procstat_mutex_pool_entry_t *entry =
+		atomic_load(&mutex_free_list);
+
+	do {
+		if (entry == NULL) return NULL;
+	} while (!atomic_compare_exchange_weak(&mutex_free_list,
+					       &entry, entry->next_free));
+
+	pthread_mutex_init(&entry->mutex, NULL);
+
+	return &entry->mutex;
+}
+
+/**
+ * @brief Return a mutex to the pool.
+ *
+ * Destroys the mutex, then returns the corresponding entry back to
+ * the free list.
+ *
+ * @par Thread safety
+ * This function is MT-Safe.
+ *
+ * @param mutex a pointer to a POSIX mutex previously obtained by @ref procstat_retain_mutex_from_pool
+ */
+static inline void procstat_release_mutex_to_pool(pthread_mutex_t *mutex)
+{
+	assert(mutex);
+
+	pthread_mutex_destroy(mutex);
+
+	procstat_mutex_pool_entry_t *entry =
+		(procstat_mutex_pool_entry_t *)mutex;
+
+	entry->next_free = atomic_load(&mutex_free_list);
+
+	do {
+		// nothing -- this will eventually work
+	} while (!atomic_compare_exchange_weak(&mutex_free_list,
+					       &entry->next_free, entry));
+}
 
 #define SERIES_RESET_CLOCK CLOCK_MONOTONIC_COARSE
 
@@ -102,7 +172,7 @@ struct procstat_context {
 	struct fuse_session *session;
 	gid_t	gid;
 	uid_t   uid;
-	pthread_mutex_t global_lock;
+	pthread_mutex_t *global_lockptr;
 };
 
 struct procstat_series {
@@ -147,12 +217,12 @@ static bool root_directory(struct procstat_context *context, struct procstat_dir
 
 static void procstat_lock(struct procstat_context *context, struct procstat_item *item) {
 	assert(item == NULL);
-	pthread_mutex_lock(&context->global_lock);
+	pthread_mutex_lock(context->global_lockptr);
 }
 
 static void procstat_unlock(struct procstat_context *context, struct procstat_item *item) {
 	assert(item == NULL);
-	pthread_mutex_unlock(&context->global_lock);
+	pthread_mutex_unlock(context->global_lockptr);
 }
 
 static bool stats_item_short_name(struct procstat_item *item)
@@ -1456,7 +1526,16 @@ struct procstat_context *procstat_create(const char *mountpoint)
 	context->uid = getuid();
 	context->gid = getgid();
 
-	pthread_mutex_init(&context->global_lock, NULL);
+	for (int ix = 0; ix < ARRAY_SIZE(mutex_pool) - 1; ++ix) {
+		mutex_pool[ix].next_free = mutex_pool + (ix + 1);
+	}
+
+	mutex_pool[ARRAY_SIZE(mutex_pool) - 1].next_free = NULL;
+	mutex_free_list = mutex_pool;
+
+	context->global_lockptr = procstat_retain_mutex_from_pool();
+	assert(context->global_lockptr);
+
 	init_directory(context, &context->root, ROOT_DIR_NAME, NULL);
 
 	channel = fuse_mount(context->mountpoint, &args);
@@ -1514,7 +1593,8 @@ void procstat_destroy(struct procstat_context *context)
 	item_put_children_locked(&context->root);
 	free(context->mountpoint);
 	procstat_unlock(context, NULL);
-	pthread_mutex_destroy(&context->global_lock);
+
+	procstat_release_mutex_to_pool(context->global_lockptr);
 
 	/* debug purposes of use after free*/
 	context->mountpoint = NULL;
