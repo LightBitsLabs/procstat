@@ -154,8 +154,9 @@ struct procstat_item {
 };
 
 struct procstat_directory {
-	struct procstat_item base;
-	struct list_head       children;
+	struct procstat_item	base;
+	struct list_head	children;
+	pthread_mutex_t		*mutexptr;
 };
 
 struct procstat_file {
@@ -172,7 +173,6 @@ struct procstat_context {
 	struct fuse_session *session;
 	gid_t	gid;
 	uid_t   uid;
-	pthread_mutex_t *global_lockptr;
 };
 
 struct procstat_series {
@@ -215,14 +215,28 @@ static bool root_directory(struct procstat_context *context, struct procstat_dir
 	return &context->root == directory;
 }
 
-static void procstat_lock(struct procstat_context *context, struct procstat_item *item) {
-	assert(item == NULL);
-	pthread_mutex_lock(context->global_lockptr);
+__attribute__((__nonnull__(1,2))) static void procstat_lock(struct procstat_context *context, struct procstat_directory *item) {
+	assert(item != NULL);
+
+	if (item->mutexptr) {
+		pthread_mutex_lock(item->mutexptr);
+	}
+	else {
+		assert(item->parent);
+		procstat_lock(context, item->base.parent);
+	}
 }
 
-static void procstat_unlock(struct procstat_context *context, struct procstat_item *item) {
-	assert(item == NULL);
-	pthread_mutex_unlock(context->global_lockptr);
+__attribute__((__nonnull__(1,2))) static void procstat_unlock(struct procstat_context *context, struct procstat_directory *item) {
+	assert(item != NULL);
+
+	if (item->mutexptr) {
+		pthread_mutex_unlock(item->mutexptr);
+	}
+	else {
+		assert(item->parent);
+		procstat_unlock(context, item->base.parent);
+	}
 }
 
 static bool stats_item_short_name(struct procstat_item *item)
@@ -335,12 +349,12 @@ static void fuse_lookup(fuse_req_t req, fuse_ino_t parent_inode, const char *nam
 
 	memset(&fuse_entry, 0, sizeof(fuse_entry));
 
-	procstat_lock(context, NULL);
 	parent = fuse_inode_to_dir(request_context(req), parent_inode);
+	procstat_lock(context, parent);
 
 	item = lookup_item_locked(parent, name, string_hash(name));
 	if ((!item) || (!item_registered(item))) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, parent);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
@@ -349,7 +363,7 @@ static void fuse_lookup(fuse_req_t req, fuse_ino_t parent_inode, const char *nam
 	item->refcnt++;
 	fuse_entry.attr_timeout = ATTRIBUTES_TIMEOUT_SEC;
 	fill_item_stats(context, item, &fuse_entry.attr);
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, parent);
 	fuse_reply_entry(req, &fuse_entry);
 }
 
@@ -358,15 +372,15 @@ static void fuse_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup) {
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item;
 
-	procstat_lock(context, NULL);
 	item = (struct procstat_item *)(ino);
+	procstat_lock(context, item->parent);
 	if (nlookup >= item->refcnt) {
 		item->refcnt = 1;
 		item_put_locked(item);
 	} else {
 		item->refcnt -= nlookup;
 	}
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	fuse_reply_none(req);
 }
 
@@ -377,16 +391,16 @@ static void fuse_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 	struct procstat_item *item;
 
 	memset(&stat, 0, sizeof(stat));
-	procstat_lock(context, NULL);
 	item = fuse_inode_to_item(context, ino);
+	procstat_lock(context, item->parent);
 	if (!item_registered(item)) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, item->parent);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 
 	fill_item_stats(context, item, &stat);
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	fuse_reply_attr(req, &stat, ATTRIBUTES_TIMEOUT_SEC);
 }
 
@@ -395,16 +409,16 @@ static void fuse_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item;
 
-	procstat_lock(context, NULL);
 	item = fuse_inode_to_item(context, ino);
+	procstat_lock(context, item->parent);
 
 	if (!item_registered(item)) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, item->parent);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 	++item->refcnt;
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	fi->fh = 0;
 	fuse_reply_open(req, fi);
 }
@@ -440,11 +454,11 @@ static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 	size_t offset;
 	int alloc_factor = 0;
 
-	procstat_lock(context, NULL);
 	dir = fuse_inode_to_dir(context, ino);
+	procstat_lock(context, dir);
 
 	if (!item_registered(&dir->base)) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, dir);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
@@ -477,7 +491,7 @@ static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 			++alloc_factor;
 			if (!new_buffer) {
-				procstat_unlock(context, NULL);
+				procstat_unlock(context, dir);
 				fuse_reply_err(req, ENOMEM);
 				goto done;
 			}
@@ -487,7 +501,7 @@ static void fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 		offset += entry_size;
 	}
 
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, dir);
 	if (off < offset)
 		fuse_reply_buf(req, reply_buffer + off, MIN(size, offset - off));
 	else
@@ -529,8 +543,8 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		return;
 	}
 
-	procstat_lock(context, NULL);
 	item = (struct procstat_item *)(ino);
+	procstat_lock(context, item->parent);
 
 	if (!item_registered(item))
 		goto out_locked;
@@ -548,13 +562,13 @@ static void fuse_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (item->flags & STATS_ENTRY_FLAG_AGGREGATOR)
 		++item->parent->base.refcnt;
 
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	fuse_reply_open(req, fi);
 
 	return;
 
 out_locked:
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	free(read_buffer);
 	fuse_reply_err(req, ret);
 }
@@ -708,7 +722,7 @@ static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct r
 	/*
 	 * While the aggregator node is open, the node and the parent directory node cannot be freed, so setting "last" above was safe.
 	 */
-	procstat_lock(context, NULL);
+	procstat_lock(context, dir);
 
 	if (!as->c.current) {
 		as->c.current = dir->children.next;
@@ -750,7 +764,7 @@ static void aggregator_read(fuse_req_t req, struct procstat_file *file, struct r
 		++(container_of(as->c.current, struct procstat_item, entry)->refcnt);
 
 	as->c.off += out.total;
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, dir);
 	fuse_reply_buf(req, &out.buf[0], out.total);
 }
 
@@ -854,21 +868,31 @@ static int register_item(struct procstat_context *context,
 			 struct procstat_item *item,
 			 struct procstat_directory *parent)
 {
-	procstat_lock(context, NULL);
+
 	if (parent) {
+		procstat_lock(context, parent);
+
 		struct procstat_item *duplicate;
 
 		duplicate = lookup_item_locked(parent, procstat_item_name(item), item->name_hash);
 		if (duplicate) {
-			procstat_unlock(context, NULL);
+			procstat_unlock(context, parent);
 			return EEXIST;
 		}
 		list_add_tail(&item->entry, &parent->children);
 	}
+	else {
+		// this is the root and it cannot be locked during creation
+	}
+
 	item->flags |= STATS_ENTRY_FLAG_REGISTERED;
 	item->refcnt = 1;
 	item->parent = parent;
-	procstat_unlock(context, NULL);
+
+	if (parent) {
+		procstat_unlock(context, parent);
+	}
+
 	return 0;
 }
 
@@ -881,6 +905,7 @@ static int init_directory(struct procstat_context *context,
 
 	init_item(&directory->base, name);
 	directory->base.flags = STATS_ENTRY_FLAG_DIR;
+	directory->mutexptr = NULL;
 	INIT_LIST_HEAD(&directory->children);
 	error = register_item(context, &directory->base, parent);
 	if (error)
@@ -993,7 +1018,7 @@ void procstat_remove(struct procstat_context *context, struct procstat_item *ite
 	assert(context);
 	assert(item);
 
-	procstat_lock(context, NULL);
+	procstat_lock(context, item->parent);
 	if (!item_type_directory(item))
 		goto remove_item;
 
@@ -1008,7 +1033,7 @@ remove_item:
 	list_del_init(&item->entry); /* Make it not discoverable */
 	item_put_locked(item);
 done:
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 }
 
 int procstat_remove_by_name(struct procstat_context *context,
@@ -1023,17 +1048,17 @@ int procstat_remove_by_name(struct procstat_context *context,
 		return -1;
 	}
 
-	procstat_lock(context, NULL);
+	procstat_lock(context, (struct procstat_directory *)parent);
 	item = lookup_item_locked((struct procstat_directory *)parent,
 				  name, string_hash(name));
 	if (!item) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, (struct procstat_directory *)parent);
 		return ENOENT;
 	}
 	item->flags &= ~STATS_ENTRY_FLAG_REGISTERED;
 	list_del_init(&item->entry); /* Make it not discoverable */
 	item_put_locked(item);
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, (struct procstat_directory *)parent);
 	return 0;
 }
 
@@ -1435,30 +1460,31 @@ void fuse_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
 	struct procstat_item *item;
 
 	memset(&stat, 0, sizeof(stat));
-	procstat_lock(context, NULL);
 
 	item = fuse_inode_to_item(context, ino);
+	procstat_lock(context, item->parent);
+
 	if (!item_registered(item)) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, item->parent);
 		fuse_reply_err(req, ENOENT);
 		return;
 	}
 
 	if (!fuse_inode_to_file(ino)->writer) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, item->parent);
 		fuse_reply_err(req, EPERM);
 		return;
 	}
 
 	/* only support for truncate as it is needed during write */
 	if (to_set != FUSE_SET_ATTR_SIZE) {
-		procstat_unlock(context, NULL);
+		procstat_unlock(context, item->parent);
 		fuse_reply_err(req, EINVAL);
 		return;
 	}
 
 	fill_item_stats(context, item, &stat);
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	fuse_reply_attr(req, &stat, 1.0);
 }
 
@@ -1467,12 +1493,12 @@ static void fuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 	struct procstat_context *context = request_context(req);
 	struct procstat_item *item = fuse_inode_to_item(request_context(req), ino);
 
-	procstat_lock(context, NULL);
+	procstat_lock(context, item->parent);
 	if (item->flags & STATS_ENTRY_FLAG_AGGREGATOR)
 		aggregator_release_locked(item, fi);
 	if (--item->refcnt == 0)
 		free_item(item);
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, item->parent);
 	if (fi->fh) {
 		struct read_struct *fh = (struct read_struct *)fi->fh;
 		free(fh->ext);
@@ -1533,10 +1559,8 @@ struct procstat_context *procstat_create(const char *mountpoint)
 	mutex_pool[ARRAY_SIZE(mutex_pool) - 1].next_free = NULL;
 	mutex_free_list = mutex_pool;
 
-	context->global_lockptr = procstat_retain_mutex_from_pool();
-	assert(context->global_lockptr);
-
 	init_directory(context, &context->root, ROOT_DIR_NAME, NULL);
+	context->root.mutexptr = procstat_retain_mutex_from_pool();
 
 	channel = fuse_mount(context->mountpoint, &args);
 	if (!channel) {
@@ -1576,7 +1600,7 @@ void procstat_destroy(struct procstat_context *context)
 	assert(context);
 	session = context->session;
 
-	procstat_lock(context, NULL);
+	procstat_lock(context, &context->root);
 	if (session) {
 		struct fuse_chan *channel = NULL;
 
@@ -1592,9 +1616,7 @@ void procstat_destroy(struct procstat_context *context)
 
 	item_put_children_locked(&context->root);
 	free(context->mountpoint);
-	procstat_unlock(context, NULL);
-
-	procstat_release_mutex_to_pool(context->global_lockptr);
+	procstat_unlock(context, &context->root);
 
 	/* debug purposes of use after free*/
 	context->mountpoint = NULL;
@@ -1823,12 +1845,12 @@ struct procstat_item *procstat_lookup_item(struct procstat_context *context,
 	struct procstat_item *item;
 
 	parent = parent_or_root(context, parent);
-	procstat_lock(context, NULL);
+	procstat_lock(context, (struct procstat_directory *)parent);
 
 	item = lookup_item_locked((struct procstat_directory *)parent,
 				  name, string_hash(name));
 
-	procstat_unlock(context, NULL);
+	procstat_unlock(context, (struct procstat_directory *)parent);
 
 	return item;
 }
