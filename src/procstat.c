@@ -54,14 +54,6 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*a))
 #endif
 
-#ifndef unlikely
-#define unlikely(x)     __builtin_expect(!!(x), 0)
-#endif
-
-#ifndef likely
-#define likely(x)       __builtin_expect(!!(x), 1)
-#endif
-
 enum {
 	STATS_ENTRY_FLAG_REGISTERED  = 1 << 0,
 	STATS_ENTRY_FLAG_DIR	     = 1 << 1,
@@ -779,32 +771,17 @@ static int register_item(struct procstat_context *context,
 			 struct procstat_item *item,
 			 struct procstat_directory *parent)
 {
-	if (likely(parent)) {
+	pthread_mutex_lock(&context->global_lock);
+	if (parent) {
 		struct procstat_item *duplicate;
-		bool locked = false;
-
-		if (unlikely(root_directory(context, parent))) {
-			/* Only root directory can be modified concurrently by different threads */
-			pthread_mutex_lock(&context->global_lock);
-			locked = true;
-		}
 
 		duplicate = lookup_item_locked(parent, procstat_item_name(item), item->name_hash);
-		if (unlikely(duplicate)) {
-			if (locked)
-				pthread_mutex_unlock(&context->global_lock);
+		if (duplicate) {
+			pthread_mutex_unlock(&context->global_lock);
 			return EEXIST;
 		}
-
-		if (likely(!locked))
-			pthread_mutex_lock(&context->global_lock);
-
 		list_add_tail(&item->entry, &parent->children);
-	} else {
-		pthread_mutex_lock(&context->global_lock);
 	}
-
-
 	item->flags |= STATS_ENTRY_FLAG_REGISTERED;
 	item->refcnt = 1;
 	item->parent = parent;
