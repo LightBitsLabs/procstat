@@ -1,7 +1,7 @@
 /*
  *   BSD LICENSE
  *
- *   Copyright (C) 2016 LightBits Labs Ltd. - All Rights Reserved
+ *   Copyright (C) 2016-2022 LightBits Labs Ltd. - All Rights Reserved
  *   All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
