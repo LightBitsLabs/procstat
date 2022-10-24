@@ -1,0 +1,19 @@
+include $(WORKSPACE_TOP)/common/Makefile.env
+
+all: build
+
+LBGO_CONTAINER_VERSION = $(shell component-tool version --repo=lb_containers --type=$(BUILD_TYPE) lbcpp)
+
+build:
+	run_in_container -i lbcpp:${LBGO_CONTAINER_VERSION} -- ${MAKE} -f Makefile.lb $@
+
+install:
+	run_in_container -i lbcpp:latest -- ${MAKE} -f Makefile.lb $@
+
+checkin:
+	run_in_container -i lbcpp:latest -- ${MAKE} -f Makefile.lb $@
+
+clean:
+	run_in_container -i lbcpp:latest -- ${MAKE} -f Makefile.lb $@
+
+.PHONY: clean checkin build
