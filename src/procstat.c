@@ -1118,6 +1118,11 @@ bool is_reset(struct reset_info* reset)
 	}
 }
 
+int procstat_u64_needs_reset(struct procstat_series_u64 *series)
+{
+	return is_reset(&series->reset);
+}
+
 void clear_values_series(struct procstat_series_u64 *series)
 {
 	series->count = 0;
@@ -1812,6 +1817,11 @@ fail_remove_stat:
 void procstat_histogram_u32_series_set_reset_interval(struct procstat_histogram_u32 *series, int reset_interval)
 {
 	series->reset.reset_interval = reset_interval;
+}
+
+int procstat_histogram_u32_needs_reset(struct procstat_histogram_u32 *series)
+{
+	return is_reset(&series->reset);
 }
 
 struct procstat_item *procstat_lookup_item(struct procstat_context *context,
